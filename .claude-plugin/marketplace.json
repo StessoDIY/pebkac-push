@@ -1,0 +1,15 @@
+{
+  "name": "pebkac-push",
+  "version": "1.0.0",
+  "description": "PEBKAC Push: Guided git workflow for non-technical contributors. Enterprise-grade commit hygiene for people who think rebase is a type of housing refinance.",
+  "author": "Stesso",
+  "homepage": "https://github.com/StessoDIY/pebkac-push",
+  "license": "MIT",
+  "skills": [
+    {
+      "name": "pebkac-push",
+      "path": "../SKILL.md",
+      "description": "A guided git workflow that helps non-technical contributors safely commit, push, and create PRs with senior-dev-level hygiene."
+    }
+  ]
+}
