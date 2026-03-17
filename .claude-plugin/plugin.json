@@ -1,0 +1,12 @@
+{
+  "name": "pebkac-push",
+  "version": "1.0.0",
+  "description": "Guided git workflow for non-technical contributors to safely commit, push, and create PRs with senior-dev-level hygiene.",
+  "author": {
+    "name": "Stesso"
+  },
+  "repository": "https://github.com/StessoDIY/pebkac-push",
+  "license": "MIT",
+  "keywords": ["git", "workflow", "pull-requests", "developer-tools", "non-technical"],
+  "skills": "./skills/"
+}
