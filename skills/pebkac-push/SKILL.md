@@ -161,7 +161,7 @@ If **all** of the following are true, offer the user a streamlined path:
 
 > "This is a small, clean set of changes — just [N] files, all related to what you described. I can do a quick review and get this pushed fast, or I can do the full deep-dive. Which do you prefer?"
 
-**Quick path** skips Phase 3 Steps 4–6 (scoped tests, regression tests, production checks) and streamlines Phase 2 to a single confirmation of the change list. The safety scan (Step 3 below) always runs regardless.
+**Quick path** skips Phase 3 Steps 5–7 (scoped tests, regression tests, production-readiness scan) and streamlines Phase 2 to a single confirmation of the change list. The safety scan (Phase 2 Step 3), lint checks (Phase 3 Step 3), and pre-commit hook dry run (Phase 3 Step 4) always run regardless.
 
 ### Step 3: Run the safety scan
 
@@ -203,6 +203,24 @@ Explain what you're doing: "I'm setting aside those formatting changes so they d
 
 Auto-detect the project's tooling and run quality checks. The user doesn't need to know what tools are installed — just find them and run them.
 
+### Fix-and-verify loop
+
+Steps 2–4 (build, lint, pre-commit hooks) form a **fix-and-verify loop**. Every time you fix something — a build error, a lint warning, an auto-fix side effect — you may introduce a new issue. The loop works like this:
+
+1. Run Steps 2–4 in order.
+2. If any step finds issues, fix them.
+3. Re-run **all** of Steps 2–4, not just the step that failed. A lint fix can break the build. A build fix can introduce a new lint warning.
+4. Repeat until all three steps pass cleanly.
+5. **Cap at 3 iterations.** If issues are still appearing after 3 full passes, stop and present what's left to the user:
+   > "I've done a few rounds of fixes, but there are still some issues I can't fully resolve automatically. Here's what's left: [list]. Want me to keep working on these, or should we flag them for the reviewer?"
+
+The first pass is usually the big one. Subsequent passes tend to catch small regressions from fixes — a missing import after removing an unused variable, a type error after adding a hook dependency, etc.
+
+**Don't loop Steps 5–7** (tests, regression tests, production scan). Those are read-only checks that don't produce fixes, so they only need to run once.
+
+Tell the user what's happening if it takes more than one pass:
+> "My fixes introduced a couple new issues — totally normal. Running the checks again to clean those up..."
+
 ### Step 1: Detect the project stack
 
 Look for these signals (check in order):
@@ -224,7 +242,109 @@ Run the project's build command. If it fails, show the user the error in plain l
 
 ### Step 3: Lint
 
-Run the project's linter. Fix auto-fixable issues automatically (most linters have a `--fix` flag). For issues that require human judgment, explain them simply and ask.
+#### Step 3a: Run linter and fix auto-fixable issues
+
+Run the project's linter with `--fix` (or equivalent) to auto-fix what it can. Scope to changed files so you're not fixing pre-existing issues across the whole codebase:
+
+```bash
+# Get all changed files (staged + unstaged) vs HEAD, excluding deleted files
+CHANGED=$(git diff --name-only --diff-filter=d HEAD)
+```
+
+```bash
+# JavaScript/TypeScript
+JS_FILES=$(echo "$CHANGED" | grep -E '\.(ts|tsx|js|jsx)$')
+[ -n "$JS_FILES" ] && npx eslint --fix $JS_FILES
+
+# Python
+PY_FILES=$(echo "$CHANGED" | grep -E '\.py$')
+if [ -n "$PY_FILES" ]; then
+  if command -v ruff >/dev/null; then
+    ruff check --fix $PY_FILES
+  elif command -v autopep8 >/dev/null; then
+    autopep8 --in-place $PY_FILES
+  fi
+fi
+
+# Rust
+[ -f Cargo.toml ] && cargo clippy --fix --allow-dirty 2>/dev/null
+
+# Go
+GO_FILES=$(echo "$CHANGED" | grep -E '\.go$')
+[ -n "$GO_FILES" ] && gofmt -w $GO_FILES
+```
+
+For issues that can't be auto-fixed and require human judgment, explain them simply and ask.
+
+#### Step 3b: Examine lint warnings for hidden bugs
+
+Most people ignore lint warnings because the build still passes. But certain categories of warnings cause real bugs that are painful to track down — things that work most of the time, then break under specific timing or state conditions.
+
+**Run the linter on the same changed files from Step 3a** (without `--fix` this time, to see remaining warnings):
+
+```bash
+# JavaScript/TypeScript (ESLint)
+[ -n "$JS_FILES" ] && npx eslint $JS_FILES
+
+# Python — check which tool is available, then run it
+if [ -n "$PY_FILES" ]; then
+  if command -v ruff >/dev/null; then
+    ruff check $PY_FILES
+  elif command -v flake8 >/dev/null; then
+    flake8 $PY_FILES
+  elif command -v pylint >/dev/null; then
+    pylint $PY_FILES
+  fi
+fi
+
+# Rust
+[ -f Cargo.toml ] && cargo clippy 2>&1 | grep "warning:"
+
+# Go
+[ -n "$GO_FILES" ] && go vet ./... 2>&1
+
+# For other stacks: run the project's lint command and filter output
+# to only warnings in changed files. Check CI config or Makefile for
+# the team's standard lint command.
+```
+
+**Triage warnings into two groups:**
+
+**Group 1 — Warnings that cause bugs** (fix these):
+
+These are the warning rules you're looking for. The technical details below are for *your* reasoning — explain findings to the user in plain language (see user-facing examples at the end of this section).
+
+- **`react-hooks/exhaustive-deps`** — The highest-priority warning. Missing dependencies in `useEffect`, `useCallback`, or `useMemo` cause *stale closures* — the hook captures an old version of a variable and never sees updates. Symptoms: UI shows stale data, effects don't re-fire when they should, callbacks use outdated state. These bugs are intermittent and maddening to reproduce.
+  - For each warning: read the hook and its dependency array. Determine what's missing and why.
+  - **Missing dependency**: Will omitting it cause the hook to use a stale value? If yes, add it. If adding it would cause an infinite re-render loop (because the dependency is re-created every render), wrap the dependency in `useCallback` or `useMemo` upstream.
+  - **Unnecessary dependency**: Remove it from the array — it's causing the hook to re-run more than it should.
+  - **If browser tools are available**: test the affected UI area before and after the fix. Navigate to the relevant page, interact with the feature, and verify the behavior is correct. These bugs often manifest as "the UI doesn't update when I change X" or "the first click works but the second doesn't."
+  - Only suppress with `// eslint-disable-next-line react-hooks/exhaustive-deps` as a last resort, and always add a comment explaining *why* the suppression is safe.
+
+- **Unused variables that suggest dead code paths** — An unused import or variable can mean a code path was accidentally disconnected. Check whether something *should* be using it.
+
+- **Unreachable code after return/throw** — Usually means a logic error where code was added in the wrong place.
+
+- **Implicit type coercions** (`eqeqeq`, `no-implicit-coercion`) — `==` instead of `===` can cause subtle type bugs.
+
+**Group 2 — Cosmetic warnings** (note but don't block):
+
+- Formatting, naming conventions, import ordering, prefer-const, etc. These are style issues. Fix them if quick, otherwise note them for the PR description.
+
+**Present to the user in plain language** — don't expose internal jargon like "stale closures" or "dependency arrays":
+
+> "The linter found some warnings. Most people ignore these, but a few of them can actually cause bugs that are really hard to track down. Let me check each one..."
+
+Then show findings grouped:
+
+> **Warnings that can cause bugs:**
+> - `src/hooks/useChatAgent.ts:86` — There's a spot where the code remembers an old version of your project info and doesn't notice when it changes. This can make the UI show outdated data. I'll fix it so it always uses the latest.
+> - `src/hooks/useChatAgent.ts:492` — Same kind of issue — a few functions are "frozen in time" and won't pick up changes. Fixing this so they stay current.
+>
+> **Cosmetic (won't cause bugs):**
+> - 2 minor style issues — I'll clean these up while I'm in there.
+
+Fix the bug-risk warnings, then re-run the linter to confirm they're resolved. If any fixes change behavior, re-test the affected UI.
 
 ### Step 4: Pre-commit hook dry run
 
@@ -369,7 +489,73 @@ If there are merge/rebase conflicts, walk the user through each one. Explain wha
 
 > "There's a conflict in `src/pricing.ts`. Someone else changed line 42 while you were also editing nearby. Here's what they changed vs. what you changed — which version should we keep?"
 
-### Step 4: Re-run quality gates post-sync
+### Step 4: Sync with sibling PRs (multi-PR environments)
+
+When multiple PRs are open against the same target branch, merging one can cause conflicts in the others — even if each PR looks clean against the target right now. The target "moves ahead" as PRs land, and what was conflict-free yesterday can be a mess tomorrow.
+
+This step catches that problem before it surprises anyone.
+
+**Check for sibling PRs** (requires `gh` CLI):
+
+```bash
+CURRENT_BRANCH=$(git branch --show-current)
+gh pr list --base [target-branch] --state open --json number,headRefName,title \
+  | jq --arg cur "$CURRENT_BRANCH" '[.[] | select(.headRefName != $cur)]'
+```
+
+This filters out the current branch's own PR so we don't try to merge ourselves into ourselves.
+
+If `gh` isn't available or not authenticated, skip this step and note it in the PR description: "Could not check for conflicts with other open PRs."
+
+**If there are no other open PRs** (after filtering), skip this step silently.
+
+**If there are other open PRs** (up to ~5), tell the user what's happening:
+
+> "There are N other PRs waiting to merge into [target]. If any of them merge before yours, new conflicts could appear. Let me check if your branch is compatible with theirs too."
+
+**For each sibling PR branch**, test for conflicts without actually merging. First, verify the working tree is clean (it should be by this point in the workflow), then use stash as a safety net:
+
+```bash
+git fetch origin [sibling-branch]
+# Safety: stash any uncommitted work (should be none, but just in case)
+DIRTY=false
+git diff --quiet HEAD && git diff --cached --quiet || DIRTY=true
+[ "$DIRTY" = true ] && git stash --include-untracked -m "pebkac-push: safety stash before sibling check"
+BEFORE=$(git rev-parse HEAD)
+git merge --no-commit --no-ff origin/[sibling-branch] 2>&1
+# Always reset to where we were — git merge --abort doesn't work
+# if the merge completed cleanly, so reset --hard is more reliable
+git reset --hard $BEFORE
+# Restore stashed work if any was stashed
+[ "$DIRTY" = true ] && git stash pop
+```
+
+If there are **more than 5 open sibling PRs**, ask the user:
+> "There are [N] other PRs targeting [target]. That's a lot to check. Do you know which ones are most likely to merge soon? I'll focus on those."
+
+**If no conflicts are found with any sibling:**
+> "Good news — your branch is clean against all the other open PRs. No surprises when things start merging."
+
+**If conflicts are found with a sibling branch:**
+> "Your branch conflicts with PR #[N] ('[title]'). If that PR merges first, you'll have conflicts to resolve. We have two options:"
+>
+> 1. **Resolve now** — I'll merge their branch into yours so you're ready regardless of merge order. This is the safer option if their PR is close to merging.
+> 2. **Note it and move on** — I'll flag it in your PR description so the reviewer knows. You'd deal with it later if and when it comes up.
+
+If the user opts to resolve now:
+```bash
+git merge origin/[sibling-branch] --no-edit
+# Resolve any conflicts with the user
+```
+
+Then re-run build and lint to make sure nothing broke.
+
+**In the PR description**, add a line under Merge notes:
+- "Checked for conflicts with N other open PRs targeting [target] — all clean" or
+- "Merged [sibling-branch] (PR #N) to pre-resolve conflicts" or
+- "Known conflict with PR #N ([title]) — will need resolution after that PR lands"
+
+### Step 5: Re-run quality gates post-sync
 
 After syncing, re-run build, lint, and the scoped tests from Phase 3. Syncing can introduce breakage even when there are no textual conflicts. If anything fails now that didn't fail before, it's likely a sync-related issue — help the user resolve it.
 
@@ -438,7 +624,8 @@ the new pricing component depends on the currency formatter added here."]
 
 ## Testing
 - Build: ✅ passing
-- Lint: ✅ passing (N auto-fixed issues)
+- Lint: ✅ passing (N auto-fixed issues; lint warnings reviewed)
+- Quality gates verified in N pass(es) — all clean
 - Scoped tests (N files related to changes): ✅ N passed, 0 failed
 - [Note if full suite was run instead, and why]
 - [New regression test added for: (feature intent) — or: "No regression test added, see reviewer notes"]
@@ -449,6 +636,9 @@ the new pricing component depends on the currency formatter added here."]
 ## Merge notes
 - Synced with latest `[target-branch]` via [merge/rebase] — no conflicts
   [or: resolved N conflicts in X, Y, Z files — details below]
+- [Sibling PR sync: describe status — e.g. checked N open PRs with no
+  conflicts, pre-resolved conflicts with specific PRs, known conflicts
+  flagged, or check skipped if gh CLI was unavailable]
 - [Any pre-existing test failures noted here]
 
 ## Reviewer notes
